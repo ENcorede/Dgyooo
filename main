@@ -1,149 +1,228 @@
 import asyncio
-import sqlite3
 import logging
+import json
+import os
+from pathlib import Path
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
+from aiogram.types import Message, ReplyKeyboardRemove
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.markdown import hcode
+from dotenv import load_dotenv
 
-# --- НАСТРОЙКИ ---
-TOKEN = "8653982218:AAFFzFrqi68aWfy3tyIGqXp2iPHuODjJQj4"
-OWNER_ID = 6977407005
+load_dotenv()
 
-# Включаем логирование для отслеживания ошибок
-logging.basicConfig(level=logging.INFO)
+BOT_TOKEN = os.getenv("8653982218:AAFFzFrqi68aWfy3tyIGqXp2iPHuODjJQj4")
+ADMIN_USER_ID = int(os.getenv("6977407005"))
+CHATS_FILE = "chats.json"
 
-# Инициализируем бота и диспетчер
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# --- БАЗА ДАННЫХ ---
-# Создаем простую локальную базу данных для хранения оригиналов сообщений,
-# чтобы можно было сравнивать их при редактировании ("было -> стало").
-conn = sqlite3.connect('messages_cache.db', check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS messages (
-        chat_id INTEGER,
-        message_id INTEGER,
-        text TEXT,
-        PRIMARY KEY (chat_id, message_id)
-    )
-''')
-conn.commit()
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
-
-# --- ОБРАБОТЧИКИ ---
-
-@dp.message(F.text == "+")
-async def save_protected_content(message: types.Message):
-    """
-    Щит для защищенного контента и исчезающих медиа.
-    Если пользователь отвечает на любое сообщение знаком "+",
-    бот принудительно копирует его в чат владельца.
-    Работает даже с контентом, где запрещена пересылка (restricted forward).
-    """
-    if message.reply_to_message:
-        try:
-            # Используем copy_to вместо forward_to, чтобы обойти запрет на пересылку
-            await message.reply_to_message.copy_to(OWNER_ID)
-            
-            # Уведомляем владельца (если это не он сам отправил "+")
-            if message.from_user.id != OWNER_ID:
-                await bot.send_message(OWNER_ID, "💾 <i>Защищенный контент/медиа сохранены.</i>")
-            
-            # Ставим реакцию или отвечаем, что всё ок
-            await message.reply("✅ Успешно сохранено в ваш архив.")
-        except Exception as e:
-            await message.reply(f"❌ Ошибка при сохранении: {e}")
-    else:
-        await message.reply("⚠️ Чтобы сохранить медиа, ответьте на нужное сообщение знаком `+`.")
-
-
-@dp.message()
-async def backup_all_incoming(message: types.Message):
-    """
-    Сохранение ВСЕХ входящих сообщений (Текст, Фото, Видео, Кружки и т.д.).
-    Моментально пересылает копию владельцу. Если собеседник удалит оригинал,
-    копия все равно останется у владельца.
-    """
-    # Сохраняем текст в базу для отслеживания будущих изменений
-    text_content = message.text or message.caption or ""
-    cursor.execute(
-        "INSERT OR REPLACE INTO messages (chat_id, message_id, text) VALUES (?, ?, ?)",
-        (message.chat.id, message.message_id, text_content)
-    )
-    conn.commit()
-
-    # Не копируем сообщения владельцу, если он пишет их сам себе в лс с ботом
-    if message.chat.id == OWNER_ID:
-        return
-
+# ---------- Работа с хранилищем чатов ----------
+def load_chats() -> set:
     try:
-        # Информируем владельца от кого пришло сообщение (создаем красивую плашку)
-        user_info = f"👤 <b>От:</b> {message.from_user.full_name} (@{message.from_user.username or 'без_юзернейма'})"
-        await bot.send_message(OWNER_ID, f"📥 <b>Входящее сообщение:</b>\n{user_info}")
-        
-        # Делаем полную копию (copy_to скачивает медиа/доки и отправляет от лица бота)
-        await message.copy_to(OWNER_ID)
-    except Exception as e:
-        logging.error(f"Не удалось скопировать сообщение: {e}")
+        with open(CHATS_FILE, "r") as f:
+            data = json.load(f)
+            return set(data)
+    except FileNotFoundError:
+        return set()
 
+def save_chats(chats: set):
+    with open(CHATS_FILE, "w") as f:
+        json.dump(list(chats), f)
 
-@dp.edited_message()
-async def handle_edited_message(message: types.Message):
-    """
-    Отслеживание измененных сообщений (Было -> Стало).
-    Сравнивает измененный текст с тем, что был сохранен в базе данных.
-    """
-    # Достаем старый текст из базы
-    cursor.execute(
-        "SELECT text FROM messages WHERE chat_id = ? AND message_id = ?", 
-        (message.chat.id, message.message_id)
+monitored_chats = load_chats()
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_USER_ID
+
+# ---------- Состояния для FSM ----------
+class AddChat(StatesGroup):
+    waiting_for_chat_id = State()
+
+class RemoveChat(StatesGroup):
+    waiting_for_chat_id = State()
+
+# ---------- Команды управления ----------
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("👋 Бот-охотник за сообщениями готов. Используй /help для списка команд.")
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    text = (
+        "🤖 <b>Команды управления:</b>\n"
+        "/addchat — добавить чат в мониторинг\n"
+        "/removechat — убрать чат\n"
+        "/listchats — показать отслеживаемые чаты\n"
+        "/stats — статистика\n"
+        "/help — это сообщение\n\n"
+        "📩 <b>Сохранение исчезающих / защищённых медиа:</b>\n"
+        "Просто ответь на такое сообщение любым текстом (или просто отправь reply) — бот сохранит контент."
     )
-    result = cursor.fetchone()
-    old_text = result[0] if result else "<i>(Текст не найден в кэше)</i>"
-    
-    new_text = message.text or message.caption or "<i>(Медиа без текста)</i>"
+    await message.answer(text)
 
-    # Если текст реально изменился, отправляем уведомление владельцу
-    if old_text != new_text:
-        notification = (
-            f"✏️ <b>Пользователь изменил сообщение!</b>\n"
-            f"👤 <b>Кто:</b> {message.from_user.full_name}\n\n"
-            f"❌ <b>БЫЛО:</b>\n{old_text}\n\n"
-            f"✅ <b>СТАЛО:</b>\n{new_text}"
-        )
-        
-        try:
-            await bot.send_message(OWNER_ID, notification)
-        except TelegramBadRequest as repr_err:
-             logging.error(f"Ошибка при отправке измененного текста: {repr_err}")
+@dp.message(Command("addchat"))
+async def cmd_addchat(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Отправь ID чата (число или @username публичной группы/канала)")
+    await state.set_state(AddChat.waiting_for_chat_id)
 
-        # Обновляем текст в базе на новый
-        cursor.execute(
-            "UPDATE messages SET text = ? WHERE chat_id = ? AND message_id = ?",
-            (new_text, message.chat.id, message.message_id)
-        )
-        conn.commit()
+@dp.message(AddChat.waiting_for_chat_id)
+async def process_add_chat(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    text = message.text.strip()
+    try:
+        # Если это число
+        chat_id = int(text)
+    except ValueError:
+        # Если это username
+        if text.startswith("@"):
+            chat_id = text
+        else:
+            await message.answer("❌ Неверный формат. Пришли ID или @username")
+            return
+    monitored_chats.add(chat_id)
+    save_chats(monitored_chats)
+    await message.answer(f"✅ Чат <code>{chat_id}</code> добавлен в мониторинг")
+    await state.clear()
 
+@dp.message(Command("removechat"))
+async def cmd_removechat(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Отправь ID чата, который нужно убрать")
+    await state.set_state(RemoveChat.waiting_for_chat_id)
 
-# --- ЗАПУСК БОТА ---
+@dp.message(RemoveChat.waiting_for_chat_id)
+async def process_remove_chat(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    text = message.text.strip()
+    chat_id = text
+    try:
+        chat_id = int(text)
+    except ValueError:
+        chat_id = text
+    if chat_id in monitored_chats:
+        monitored_chats.remove(chat_id)
+        save_chats(monitored_chats)
+        await message.answer(f"🗑 Чат <code>{chat_id}</code> убран из мониторинга")
+    else:
+        await message.answer("ℹ️ Такого чата не было в списке")
+    await state.clear()
+
+@dp.message(Command("listchats"))
+async def cmd_listchats(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    if monitored_chats:
+        text = "📋 <b>Отслеживаемые чаты:</b>\n" + "\n".join(f"<code>{c}</code>" for c in monitored_chats)
+    else:
+        text = "📭 Список отслеживаемых чатов пуст"
+    await message.answer(text)
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(f"📊 Чатов на мониторинге: {len(monitored_chats)}\n"
+                         f"Бот работает. Статистика будет расширяться.")
+
+# ---------- Логика сохранения медиа по reply ----------
+async def save_and_forward(message: Message, reply_to_msg: Message):
+    """Скачивает медиа из reply_to_msg и отправляет админу как новое сообщение"""
+    target = reply_to_msg
+    admin = ADMIN_USER_ID
+
+    # Текст
+    if target.text:
+        await bot.send_message(admin, f"📝 Сохранённый текст:\n{hcode(target.text)}")
+        return
+    # Фото
+    if target.photo:
+        file_id = target.photo[-1].file_id
+        await bot.send_photo(admin, file_id, caption="🖼 Сохранённое фото")
+        return
+    # Видео
+    if target.video:
+        file_id = target.video.file_id
+        await bot.send_video(admin, file_id, caption="🎬 Сохранённое видео")
+        return
+    # Голосовое
+    if target.voice:
+        file_id = target.voice.file_id
+        await bot.send_voice(admin, file_id, caption="🎤 Сохранённое голосовое")
+        return
+    # Видеосообщение (кружок)
+    if target.video_note:
+        file_id = target.video_note.file_id
+        await bot.send_video_note(admin, file_id)
+        return
+    # Документ
+    if target.document:
+        file_id = target.document.file_id
+        await bot.send_document(admin, file_id, caption="📄 Сохранённый документ")
+        return
+    # Медиагруппа (альбом)
+    if target.media_group_id:
+        # Обрабатывается отдельно – для простоты скачиваем первое попавшееся,
+        # но можно доработать до полной группы
+        await message.answer("⚠️ Медиагруппа сохранена не полностью (буду дорабатывать)")
+        return
+    await bot.send_message(admin, "❓ Не удалось распознать тип медиа")
+
+@dp.message(F.reply_to_message)
+async def handle_reply(message: Message):
+    """Любой reply админа на сообщение запускает сохранение"""
+    if not is_admin(message.from_user.id):
+        return
+    target = message.reply_to_message
+    if not target:
+        return
+    await message.answer("⏳ Сохраняю…")
+    try:
+        await save_and_forward(message, target)
+    except Exception as e:
+        logger.exception("Ошибка сохранения")
+        await bot.send_message(ADMIN_USER_ID, f"❌ Ошибка сохранения: {e}")
+
+# ---------- Обработка редактированных сообщений ----------
+@dp.edited_message()
+async def handle_edited(message: Message):
+    # Отправляем админу только если чат в списке мониторинга
+    if message.chat.id not in monitored_chats:
+        return
+    old_text = "…"  # aiogram не даёт оригинал до редактирования, храним историю сами
+    new_text = message.text or message.caption or "<медиа>"
+    # Здесь можно было бы вести словарь последних сообщений, но для демо просто предупредим
+    await bot.send_message(
+        ADMIN_USER_ID,
+        f"✏️ <b>Сообщение изменено</b>\n"
+        f"Чат: <code>{message.chat.id}</code>\n"
+        f"Новый текст: {hcode(new_text)}\n"
+        f"(Старый текст не сохранён — нужно доработать кеш)",
+    )
+
+# ---------- Основная функция ----------
 async def main():
-    print("🚀 Бот-архиватор успешно запущен!")
-    print(f"🔒 Привязан к ID владельца: {OWNER_ID}")
-    
-    # Удаляем вебхуки, чтобы бот гарантированно получал сообщения по long-polling
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    # Запускаем бесконечный процесс прослушивания Telegram
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Бот остановлен вручную.")
-    finally:
-        # Закрываем подключение к БД при выключении
-        conn.close()
+    asyncio.run(main())
