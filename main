@@ -1,0 +1,149 @@
+import asyncio
+import sqlite3
+import logging
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest
+
+# --- НАСТРОЙКИ ---
+TOKEN = "8653982218:AAFFzFrqi68aWfy3tyIGqXp2iPHuODjJQj4"
+OWNER_ID = 6977407005
+
+# Включаем логирование для отслеживания ошибок
+logging.basicConfig(level=logging.INFO)
+
+# Инициализируем бота и диспетчер
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
+# --- БАЗА ДАННЫХ ---
+# Создаем простую локальную базу данных для хранения оригиналов сообщений,
+# чтобы можно было сравнивать их при редактировании ("было -> стало").
+conn = sqlite3.connect('messages_cache.db', check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS messages (
+        chat_id INTEGER,
+        message_id INTEGER,
+        text TEXT,
+        PRIMARY KEY (chat_id, message_id)
+    )
+''')
+conn.commit()
+
+
+# --- ОБРАБОТЧИКИ ---
+
+@dp.message(F.text == "+")
+async def save_protected_content(message: types.Message):
+    """
+    Щит для защищенного контента и исчезающих медиа.
+    Если пользователь отвечает на любое сообщение знаком "+",
+    бот принудительно копирует его в чат владельца.
+    Работает даже с контентом, где запрещена пересылка (restricted forward).
+    """
+    if message.reply_to_message:
+        try:
+            # Используем copy_to вместо forward_to, чтобы обойти запрет на пересылку
+            await message.reply_to_message.copy_to(OWNER_ID)
+            
+            # Уведомляем владельца (если это не он сам отправил "+")
+            if message.from_user.id != OWNER_ID:
+                await bot.send_message(OWNER_ID, "💾 <i>Защищенный контент/медиа сохранены.</i>")
+            
+            # Ставим реакцию или отвечаем, что всё ок
+            await message.reply("✅ Успешно сохранено в ваш архив.")
+        except Exception as e:
+            await message.reply(f"❌ Ошибка при сохранении: {e}")
+    else:
+        await message.reply("⚠️ Чтобы сохранить медиа, ответьте на нужное сообщение знаком `+`.")
+
+
+@dp.message()
+async def backup_all_incoming(message: types.Message):
+    """
+    Сохранение ВСЕХ входящих сообщений (Текст, Фото, Видео, Кружки и т.д.).
+    Моментально пересылает копию владельцу. Если собеседник удалит оригинал,
+    копия все равно останется у владельца.
+    """
+    # Сохраняем текст в базу для отслеживания будущих изменений
+    text_content = message.text or message.caption or ""
+    cursor.execute(
+        "INSERT OR REPLACE INTO messages (chat_id, message_id, text) VALUES (?, ?, ?)",
+        (message.chat.id, message.message_id, text_content)
+    )
+    conn.commit()
+
+    # Не копируем сообщения владельцу, если он пишет их сам себе в лс с ботом
+    if message.chat.id == OWNER_ID:
+        return
+
+    try:
+        # Информируем владельца от кого пришло сообщение (создаем красивую плашку)
+        user_info = f"👤 <b>От:</b> {message.from_user.full_name} (@{message.from_user.username or 'без_юзернейма'})"
+        await bot.send_message(OWNER_ID, f"📥 <b>Входящее сообщение:</b>\n{user_info}")
+        
+        # Делаем полную копию (copy_to скачивает медиа/доки и отправляет от лица бота)
+        await message.copy_to(OWNER_ID)
+    except Exception as e:
+        logging.error(f"Не удалось скопировать сообщение: {e}")
+
+
+@dp.edited_message()
+async def handle_edited_message(message: types.Message):
+    """
+    Отслеживание измененных сообщений (Было -> Стало).
+    Сравнивает измененный текст с тем, что был сохранен в базе данных.
+    """
+    # Достаем старый текст из базы
+    cursor.execute(
+        "SELECT text FROM messages WHERE chat_id = ? AND message_id = ?", 
+        (message.chat.id, message.message_id)
+    )
+    result = cursor.fetchone()
+    old_text = result[0] if result else "<i>(Текст не найден в кэше)</i>"
+    
+    new_text = message.text or message.caption or "<i>(Медиа без текста)</i>"
+
+    # Если текст реально изменился, отправляем уведомление владельцу
+    if old_text != new_text:
+        notification = (
+            f"✏️ <b>Пользователь изменил сообщение!</b>\n"
+            f"👤 <b>Кто:</b> {message.from_user.full_name}\n\n"
+            f"❌ <b>БЫЛО:</b>\n{old_text}\n\n"
+            f"✅ <b>СТАЛО:</b>\n{new_text}"
+        )
+        
+        try:
+            await bot.send_message(OWNER_ID, notification)
+        except TelegramBadRequest as repr_err:
+             logging.error(f"Ошибка при отправке измененного текста: {repr_err}")
+
+        # Обновляем текст в базе на новый
+        cursor.execute(
+            "UPDATE messages SET text = ? WHERE chat_id = ? AND message_id = ?",
+            (new_text, message.chat.id, message.message_id)
+        )
+        conn.commit()
+
+
+# --- ЗАПУСК БОТА ---
+async def main():
+    print("🚀 Бот-архиватор успешно запущен!")
+    print(f"🔒 Привязан к ID владельца: {OWNER_ID}")
+    
+    # Удаляем вебхуки, чтобы бот гарантированно получал сообщения по long-polling
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Запускаем бесконечный процесс прослушивания Telegram
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Бот остановлен вручную.")
+    finally:
+        # Закрываем подключение к БД при выключении
+        conn.close()
