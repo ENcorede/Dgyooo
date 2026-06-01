@@ -1,36 +1,40 @@
 import asyncio
-import logging
 import json
 import os
-from pathlib import Path
+import logging
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardRemove
+from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.markdown import hcode
-from dotenv import load_dotenv
 
-load_dotenv()
+# ---------- ВСТРОЕННЫЕ ДАННЫЕ (замени на свои) ----------
+BOT_TOKEN = "8653982218:AAFFzFrqi68aWfy3tyIGqXp2iPHuODjJQj4"
+ADMIN_USER_ID = 6977407005
+# ----------------------------------------------------------
 
-BOT_TOKEN = os.getenv("8653982218:AAFFzFrqi68aWfy3tyIGqXp2iPHuODjJQj4")
-ADMIN_USER_ID = int(os.getenv("6977407005"))
-CHATS_FILE = "chats.json"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# ---------- Работа с хранилищем чатов ----------
+# Хранилище чатов и кеша сообщений
+CHATS_FILE = "chats.json"
+MESSAGE_CACHE = {}  # {chat_id: {message_id: {"text": ..., "date": ..., "from": ...}}}
+
+# ---------- Работа с чатами ----------
 def load_chats() -> set:
     try:
         with open(CHATS_FILE, "r") as f:
-            data = json.load(f)
-            return set(data)
+            return set(json.load(f))
     except FileNotFoundError:
         return set()
 
@@ -43,14 +47,14 @@ monitored_chats = load_chats()
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_USER_ID
 
-# ---------- Состояния для FSM ----------
+# ---------- Состояния FSM ----------
 class AddChat(StatesGroup):
     waiting_for_chat_id = State()
 
 class RemoveChat(StatesGroup):
     waiting_for_chat_id = State()
 
-# ---------- Команды управления ----------
+# ---------- Команды ----------
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if not is_admin(message.from_user.id):
@@ -69,7 +73,9 @@ async def cmd_help(message: Message):
         "/stats — статистика\n"
         "/help — это сообщение\n\n"
         "📩 <b>Сохранение исчезающих / защищённых медиа:</b>\n"
-        "Просто ответь на такое сообщение любым текстом (или просто отправь reply) — бот сохранит контент."
+        "Просто ответь на такое сообщение любым текстом — бот сохранит контент.\n\n"
+        "✏️ <b>Редактирование:</b>\n"
+        "Бот показывает старый и новый текст, если сообщение изменено."
     )
     await message.answer(text)
 
@@ -87,10 +93,8 @@ async def process_add_chat(message: Message, state: FSMContext):
         return
     text = message.text.strip()
     try:
-        # Если это число
         chat_id = int(text)
     except ValueError:
-        # Если это username
         if text.startswith("@"):
             chat_id = text
         else:
@@ -141,55 +145,95 @@ async def cmd_listchats(message: Message):
 async def cmd_stats(message: Message):
     if not is_admin(message.from_user.id):
         return
-    await message.answer(f"📊 Чатов на мониторинге: {len(monitored_chats)}\n"
-                         f"Бот работает. Статистика будет расширяться.")
+    cached_count = sum(len(msgs) for msgs in MESSAGE_CACHE.values())
+    await message.answer(
+        f"📊 Чатов на мониторинге: {len(monitored_chats)}\n"
+        f"Сообщений в кеше: {cached_count}\n"
+        f"Бот работает стабильно."
+    )
 
-# ---------- Логика сохранения медиа по reply ----------
-async def save_and_forward(message: Message, reply_to_msg: Message):
-    """Скачивает медиа из reply_to_msg и отправляет админу как новое сообщение"""
-    target = reply_to_msg
-    admin = ADMIN_USER_ID
+# ---------- Кеширование всех новых сообщений ----------
+@dp.message()
+async def cache_message(message: Message):
+    """Сохраняем каждое входящее сообщение в кеш для отслеживания редактирования"""
+    if not is_admin(message.from_user.id) or message.chat.id not in monitored_chats:
+        return  # Не спамим админу, если сообщение не из отслеживаемого чата
+    # Кешируем
+    if message.chat.id not in MESSAGE_CACHE:
+        MESSAGE_CACHE[message.chat.id] = {}
+    MESSAGE_CACHE[message.chat.id][message.message_id] = {
+        "text": message.text or message.caption or "",
+        "date": message.date,
+        "from_user": message.from_user.full_name if message.from_user else "Неизвестный"
+    }
+    # Очищаем старые записи (старше 1 часа)
+    now = datetime.now()
+    to_delete = []
+    for msg_id, data in MESSAGE_CACHE[message.chat.id].items():
+        if now - data["date"] > timedelta(hours=1):
+            to_delete.append(msg_id)
+    for msg_id in to_delete:
+        del MESSAGE_CACHE[message.chat.id][msg_id]
 
-    # Текст
-    if target.text:
-        await bot.send_message(admin, f"📝 Сохранённый текст:\n{hcode(target.text)}")
+# ---------- Обработка редактированных сообщений ----------
+@dp.edited_message()
+async def handle_edited(message: Message):
+    if message.chat.id not in monitored_chats:
         return
-    # Фото
+    chat_cache = MESSAGE_CACHE.get(message.chat.id, {})
+    old_data = chat_cache.get(message.message_id, {})
+    old_text = old_data.get("text", "<не сохранено>")
+    new_text = message.text or message.caption or "<медиа без подписи>"
+
+    await bot.send_message(
+        ADMIN_USER_ID,
+        f"✏️ <b>Сообщение изменено в чате</b> <code>{message.chat.id}</code>\n"
+        f"От: {old_data.get('from_user', '?')}\n"
+        f"Было: {hcode(old_text)}\n"
+        f"Стало: {hcode(new_text)}"
+    )
+    # Обновляем кеш
+    if message.chat.id in MESSAGE_CACHE and message.message_id in MESSAGE_CACHE[message.chat.id]:
+        MESSAGE_CACHE[message.chat.id][message.message_id]["text"] = new_text
+
+# ---------- Сохранение медиа по reply ----------
+async def save_and_forward(target: Message):
+    """Скачивает и пересылает админу любое медиа из target"""
+    if target.text and not target.photo and not target.video and not target.document:
+        await bot.send_message(ADMIN_USER_ID, f"📝 Сохранённый текст:\n{hcode(target.text)}")
+        return
     if target.photo:
         file_id = target.photo[-1].file_id
-        await bot.send_photo(admin, file_id, caption="🖼 Сохранённое фото")
+        caption = target.caption or ""
+        await bot.send_photo(ADMIN_USER_ID, file_id, caption=f"🖼 Сохранённое фото\n{caption}")
         return
-    # Видео
     if target.video:
         file_id = target.video.file_id
-        await bot.send_video(admin, file_id, caption="🎬 Сохранённое видео")
+        caption = target.caption or ""
+        await bot.send_video(ADMIN_USER_ID, file_id, caption=f"🎬 Сохранённое видео\n{caption}")
         return
-    # Голосовое
     if target.voice:
-        file_id = target.voice.file_id
-        await bot.send_voice(admin, file_id, caption="🎤 Сохранённое голосовое")
+        await bot.send_voice(ADMIN_USER_ID, target.voice.file_id, caption="🎤 Сохранённое голосовое")
         return
-    # Видеосообщение (кружок)
     if target.video_note:
-        file_id = target.video_note.file_id
-        await bot.send_video_note(admin, file_id)
+        await bot.send_video_note(ADMIN_USER_ID, target.video_note.file_id)
         return
-    # Документ
     if target.document:
         file_id = target.document.file_id
-        await bot.send_document(admin, file_id, caption="📄 Сохранённый документ")
+        caption = target.caption or ""
+        await bot.send_document(ADMIN_USER_ID, file_id, caption=f"📄 Сохранённый документ\n{caption}")
         return
-    # Медиагруппа (альбом)
-    if target.media_group_id:
-        # Обрабатывается отдельно – для простоты скачиваем первое попавшееся,
-        # но можно доработать до полной группы
-        await message.answer("⚠️ Медиагруппа сохранена не полностью (буду дорабатывать)")
+    if target.animation:
+        await bot.send_animation(ADMIN_USER_ID, target.animation.file_id, caption="🎞 Сохранённая GIF")
         return
-    await bot.send_message(admin, "❓ Не удалось распознать тип медиа")
+    if target.sticker:
+        await bot.send_sticker(ADMIN_USER_ID, target.sticker.file_id)
+        return
+    await bot.send_message(ADMIN_USER_ID, "❓ Не удалось распознать тип контента")
 
 @dp.message(F.reply_to_message)
 async def handle_reply(message: Message):
-    """Любой reply админа на сообщение запускает сохранение"""
+    """Ответ на сообщение (reply) = сохранение контента"""
     if not is_admin(message.from_user.id):
         return
     target = message.reply_to_message
@@ -197,30 +241,28 @@ async def handle_reply(message: Message):
         return
     await message.answer("⏳ Сохраняю…")
     try:
-        await save_and_forward(message, target)
+        await save_and_forward(target)
     except Exception as e:
         logger.exception("Ошибка сохранения")
-        await bot.send_message(ADMIN_USER_ID, f"❌ Ошибка сохранения: {e}")
+        await bot.send_message(ADMIN_USER_ID, f"❌ Ошибка: {e}")
 
-# ---------- Обработка редактированных сообщений ----------
-@dp.edited_message()
-async def handle_edited(message: Message):
-    # Отправляем админу только если чат в списке мониторинга
-    if message.chat.id not in monitored_chats:
-        return
-    old_text = "…"  # aiogram не даёт оригинал до редактирования, храним историю сами
-    new_text = message.text or message.caption or "<медиа>"
-    # Здесь можно было бы вести словарь последних сообщений, но для демо просто предупредим
-    await bot.send_message(
-        ADMIN_USER_ID,
-        f"✏️ <b>Сообщение изменено</b>\n"
-        f"Чат: <code>{message.chat.id}</code>\n"
-        f"Новый текст: {hcode(new_text)}\n"
-        f"(Старый текст не сохранён — нужно доработать кеш)",
-    )
+# ---------- Очистка кеша раз в 10 минут ----------
+async def periodic_cache_cleaner():
+    while True:
+        await asyncio.sleep(600)
+        now = datetime.now()
+        for chat_id in list(MESSAGE_CACHE.keys()):
+            MESSAGE_CACHE[chat_id] = {
+                msg_id: data
+                for msg_id, data in MESSAGE_CACHE[chat_id].items()
+                if now - data["date"] < timedelta(hours=1)
+            }
+            if not MESSAGE_CACHE[chat_id]:
+                del MESSAGE_CACHE[chat_id]
+        logger.info("Кеш очищен")
 
-# ---------- Основная функция ----------
 async def main():
+    asyncio.create_task(periodic_cache_cleaner())
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
